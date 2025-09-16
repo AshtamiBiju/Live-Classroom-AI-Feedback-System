@@ -1,74 +1,96 @@
 import cv2
-from mtcnn import MTCNN
+import torch
 import numpy as np
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from scipy.spatial.distance import cosine
 
-# Initialize detector
-detector = MTCNN()
+# --- SETUP ---
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print("Using device:", device)
 
-# Simple tracker: keeps a list of previous face centers
-tracked_faces = []
-DIST_THRESHOLD = 50  # pixels
+# Face detector
+mtcnn = MTCNN(keep_all=True, device=device)
 
-# Function to check if a face is already tracked
-def is_tracked(face_center):
-    for i, center in enumerate(tracked_faces):
-        dist = np.linalg.norm(np.array(face_center) - np.array(center))
-        if dist < DIST_THRESHOLD:
-            return i  # Return index of existing face
-    return -1
+# Face embedding model
+resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-# List to store cropped faces as numpy arrays
-cropped_faces_array = []
+# Threshold for considering a new face vs existing
+SIMILARITY_THRESHOLD = 0.6
 
-# Simulate processing multiple images (replace this with your loop or camera frames)
-image_paths = ["hello.jpg", "imag2.jpg", "jjj.jpg"]  # replace with your images
-face_id_counter = 1
+# Known faces: {id: embedding_vector}
+known_faces = {}
+next_face_id = 0
 
-for image_path in image_paths:
-    img = cv2.imread(image_path)
-    if img is None:
-        print(f"Image {image_path} not found.")
-        continue
+# Function to compute embedding for a cropped face
+def get_embedding(face_img):
+    face_img = cv2.resize(face_img, (160, 160))
+    face_img = torch.tensor(face_img, device=device).permute(2, 0, 1).float() / 255.0
+    face_img = face_img.unsqueeze(0)
+    embedding = resnet(face_img).detach().cpu().numpy()
+    return embedding[0]
 
-    results = detector.detect_faces(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    
-    for result in results:
-        x, y, width, height = result['box']
-        x, y = max(0, x), max(0, y)
-        face_center = (x + width // 2, y + height // 2)
-        
-        idx = is_tracked(face_center)
-        if idx == -1:
-            # New face
-            tracked_faces.append(face_center)
-            face_id = face_id_counter
-            face_id_counter += 1
-        else:
-            # Already tracked face
-            face_id = idx + 1
-            tracked_faces[idx] = face_center  # Update center
+# Function to find best match
+def find_match(embedding):
+    if not known_faces:
+        return None
+    min_distance = float('inf')
+    matched_id = None
+    for face_id, known_embedding in known_faces.items():
+        dist = cosine(embedding, known_embedding)
+        if dist < min_distance:
+            min_distance = dist
+            matched_id = face_id
+    if min_distance < SIMILARITY_THRESHOLD:
+        return matched_id
+    return None
 
-        # Draw rectangle and label
-        cv2.rectangle(img, (x, y), (x + width, y + height), (255, 0, 0), 2)
-        cv2.putText(img, f"ID {face_id}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+# --- START CAMERA ---
+cap = cv2.VideoCapture(0)
 
-        # Crop face
-        face_crop = img[y:y + height, x:x + width]
+print("Press 'q' to quit")
 
-        # Save face crop as image (optional)
-        cv2.imwrite(f"face_{face_id}.jpg", face_crop)
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        # Resize face crop to same size (optional but recommended for arrays)
-        face_resized = cv2.resize(face_crop, (160, 160))
-        cropped_faces_array.append(face_resized)
+    # Detect faces
+    boxes, _ = mtcnn.detect(frame)
 
-    print(f"Processed {image_path}, detected {len(results)} faces.")
+    if boxes is not None:
+        for box in boxes:
+            x1, y1, x2, y2 = [int(b) for b in box]
 
-    cv2.imshow("Faces Detected", img)
-    cv2.waitKey(0)
+            # Crop face region
+            face = frame[y1:y2, x1:x2]
+            if face.size == 0:
+                continue
 
+            # Get embedding
+            embedding = get_embedding(face)
+
+            # Check if this face matches an existing one
+            face_id = find_match(embedding)
+
+            # If not found, assign a new ID
+            if face_id is None:
+                face_id = next_face_id
+                known_faces[face_id] = embedding
+                next_face_id += 1
+
+            # Draw box and ID
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame, f"ID {face_id}", (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    cv2.imshow('Face Recognition', frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
 cv2.destroyAllWindows()
 
-# Convert list to numpy array
-cropped_faces_array = np.array(cropped_faces_array)
-print(f"Shape of cropped faces array: {cropped_faces_array.shape}")
+# Save embeddings for later use
+np.save('known_faces_embeddings.npy', known_faces)
+print("Saved known faces to known_faces_embeddings.npy")
